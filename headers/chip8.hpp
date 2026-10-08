@@ -6,11 +6,7 @@
 #include <memory>
 #include <random>
 #include <cstring>
-
-std::random_device rd;
-std::mt19937 gen(rd());
-
-std::uniform_int_distribution<uint8_t> randByte;
+#include <stdexcept>
 
 const unsigned int VIDEO_WIDTH = 64;
 const unsigned int VIDEO_HEIGHT = 32;
@@ -28,7 +24,14 @@ public:
   uint8_t soundTimer{};
   uint8_t keypad[16]{};
   uint32_t video[VIDEO_WIDTH * VIDEO_HEIGHT]{};
-  uint16_t opcode;
+  uint16_t opcode{};
+
+  // Quirks for compatibility with different ROMs
+  bool shiftIsModern = true;      // true: Vx >>= 1, false: Vx = Vy >> 1 (original CHIP-8)
+  bool memoryIncrementQuirk = false; // true: I is incremented by Fx55/Fx65 (original CHIP-8)
+
+  std::mt19937 gen{std::random_device{}()};
+  std::uniform_int_distribution<int> randByte{0, 255};
 
   static const unsigned int START_ADDRESS = 0x200;
 
@@ -57,10 +60,10 @@ public:
 
   typedef void (Chip8::*Chip8Func)();
   Chip8Func table[0xF + 1];
-  Chip8Func table0[0xE + 1];
-  Chip8Func table8[0xE + 1];
-  Chip8Func tableE[0xE + 1];
-  Chip8Func tableF[0x65 + 1];
+  Chip8Func table0[0xF + 1];
+  Chip8Func table8[0xF + 1];
+  Chip8Func tableE[0xF + 1];
+  Chip8Func tableF[0x100];
 
   void Table0()
   {
@@ -94,8 +97,6 @@ public:
       memory[FONTSET_START_ADDRESS + i] = fontset[i];
     }
 
-    randByte = std::uniform_int_distribution<uint8_t>(0, 255U);
-
     // Set up function pointer table
     table[0x0] = &Chip8::Table0;
     table[0x1] = &Chip8::OP_1nnn;
@@ -114,7 +115,7 @@ public:
     table[0xE] = &Chip8::TableE;
     table[0xF] = &Chip8::TableF;
 
-    for (size_t i = 0; i <= 0xE; i++)
+    for (size_t i = 0; i <= 0xF; i++)
     {
       table0[i] = &Chip8::OP_NULL;
       table8[i] = &Chip8::OP_NULL;
@@ -137,7 +138,7 @@ public:
     tableE[0x1] = &Chip8::OP_ExA1;
     tableE[0xE] = &Chip8::OP_Ex9E;
 
-    for (size_t i = 0; i <= 0x65; i++)
+    for (size_t i = 0; i <= 0xFF; i++)
     {
       tableF[i] = &Chip8::OP_NULL;
     }
@@ -153,47 +154,72 @@ public:
     tableF[0x65] = &Chip8::OP_Fx65;
   }
 
-  void LoadROM(char const *filename)
+  bool LoadROM(char const *filename)
   {
     // Open the file as a stream of binary
     std::ifstream file(filename, std::ios::binary | std::ios::ate);
 
-    if (file.is_open())
+    if (!file.is_open())
     {
-      // Get size of file and allocate a buffer
-      std::streampos size = file.tellg();
-      std::unique_ptr<char[]> buffer = std::make_unique<char[]>(size);
-
-      // Fill the buffer
-      file.seekg(0, std::ios::beg);
-      file.read(buffer.get(), size);
-      file.close();
-
-      // Load the ROM content into the Chip8's memory
-      for (long i = 0; i < size; i++)
-      {
-        memory[START_ADDRESS + i] = buffer[i];
-      }
+      return false;
     }
+
+    // Get size of file and allocate a buffer
+    std::streampos end = file.tellg();
+    if (end < 0)
+    {
+      return false;
+    }
+
+    size_t size = static_cast<size_t>(end);
+    if (size == 0 || size > sizeof(memory) - START_ADDRESS)
+    {
+      return false;
+    }
+
+    file.seekg(0, std::ios::beg);
+    std::unique_ptr<uint8_t[]> buffer = std::make_unique<uint8_t[]>(size);
+
+    if (!file.read(reinterpret_cast<char *>(buffer.get()), static_cast<std::streamsize>(size)))
+    {
+      return false;
+    }
+    file.close();
+
+    // Load the ROM content into the Chip8's memory
+    for (size_t i = 0; i < size; i++)
+    {
+      memory[START_ADDRESS + i] = buffer[i];
+    }
+
+    return true;
   }
 
   void Cycle()
   {
+    // Guard against jumping outside memory
+    if (pc >= sizeof(memory) - 1)
+    {
+      throw std::runtime_error("PC out of bounds");
+    }
+
     // Fetch
-    opcode = (memory[pc] << 8u) | memory[pc + 1];
+    opcode = (static_cast<uint16_t>(memory[pc]) << 8u) | memory[pc + 1];
 
     pc += 2;
 
     // Decode and Execute
     ((*this).*(table[(opcode & 0xF000u) >> 12u]))();
+  }
 
-    // Decrement the delay timer if it's been set
+  // Timers tick at 60Hz, independently of CPU speed. Call from main loop.
+  void TickTimers()
+  {
     if (delayTimer > 0)
     {
       --delayTimer;
     }
 
-    // Decrement the sound timer if it's been set
     if (soundTimer > 0)
     {
       --soundTimer;
@@ -213,6 +239,10 @@ public:
   // RET : Return from a subroutine
   void OP_00EE()
   {
+    if (sp == 0)
+    {
+      throw std::runtime_error("Stack underflow on RET");
+    }
     --sp;
     pc = stack[sp];
   }
@@ -230,6 +260,10 @@ public:
   {
     uint16_t address = opcode & 0x0FFFu;
 
+    if (sp >= sizeof(stack) / sizeof(stack[0]))
+    {
+      throw std::runtime_error("Stack overflow on CALL");
+    }
     stack[sp] = pc;
     ++sp;
     pc = address;
@@ -351,7 +385,7 @@ public:
     uint8_t Vx = (opcode & 0x0F00u) >> 8u;
     uint8_t Vy = (opcode & 0x00F0u) >> 4u;
 
-    if (registers[Vx] > registers[Vy])
+    if (registers[Vx] >= registers[Vy])
     {
       registers[0xF] = 1;
     }
@@ -367,6 +401,12 @@ public:
   void OP_8xy6()
   {
     uint8_t Vx = (opcode & 0x0F00u) >> 8u;
+    uint8_t Vy = (opcode & 0x00F0u) >> 4u;
+
+    if (!shiftIsModern)
+    {
+      registers[Vx] = registers[Vy];
+    }
 
     // Save LSB in VF
     registers[0xF] = (registers[Vx] & 0x1u);
@@ -380,7 +420,7 @@ public:
     uint8_t Vx = (opcode & 0x0F00u) >> 8u;
     uint8_t Vy = (opcode & 0x00F0u) >> 4u;
 
-    if (registers[Vy] > registers[Vx])
+    if (registers[Vy] >= registers[Vx])
     {
       registers[0xF] = 1;
     }
@@ -396,6 +436,12 @@ public:
   void OP_8xyE()
   {
     uint8_t Vx = (opcode & 0x0F00u) >> 8u;
+    uint8_t Vy = (opcode & 0x00F0u) >> 4u;
+
+    if (!shiftIsModern)
+    {
+      registers[Vx] = registers[Vy];
+    }
 
     // Save MSB in VF
     registers[0xF] = (registers[Vx] & 0x80u) >> 7u;
@@ -437,13 +483,13 @@ public:
     uint8_t Vx = (opcode & 0x0F00u) >> 8u;
     uint8_t byte = opcode & 0x00FFu;
 
-    registers[Vx] = randByte(gen) & byte;
+    registers[Vx] = static_cast<uint8_t>(randByte(gen)) & byte;
   }
 
   // DRW Vx, Vy, nibble : Display n-byte sprite starting at memory location I at (Vx, Vy), set VF = collision
   void OP_Dxyn()
   {
-    uint8_t Vx = (opcode & 0xF00u) >> 8u;
+    uint8_t Vx = (opcode & 0x0F00u) >> 8u;
     uint8_t Vy = (opcode & 0x00F0u) >> 4u;
     uint8_t height = opcode & 0x000Fu;
 
@@ -455,10 +501,20 @@ public:
 
     for (unsigned int row = 0; row < height; row++)
     {
+      if (static_cast<size_t>(index) + row >= sizeof(memory))
+      {
+        break;
+      }
       uint8_t spriteByte = memory[index + row];
 
       for (unsigned int col = 0; col < 8; col++)
       {
+        // Clip sprites at screen edges instead of wrapping per-pixel
+        if (xPos + col >= VIDEO_WIDTH || yPos + row >= VIDEO_HEIGHT)
+        {
+          continue;
+        }
+
         uint8_t spritePixel = spriteByte & (0x80u >> col);
         uint32_t *screenPixel = &video[(yPos + row) * VIDEO_WIDTH + (xPos + col)];
 
@@ -483,7 +539,7 @@ public:
     uint8_t Vx = (opcode & 0x0F00u) >> 8u;
     uint8_t key = registers[Vx];
 
-    if (keypad[key])
+    if (key < sizeof(keypad) / sizeof(keypad[0]) && keypad[key])
     {
       pc += 2;
     }
@@ -495,7 +551,7 @@ public:
     uint8_t Vx = (opcode & 0x0F00u) >> 8u;
     uint8_t key = registers[Vx];
 
-    if (!keypad[key])
+    if (key < sizeof(keypad) / sizeof(keypad[0]) && !keypad[key])
     {
       pc += 2;
     }
@@ -606,7 +662,7 @@ public:
   {
     uint8_t Vx = (opcode & 0x0F00u) >> 8u;
 
-    index += registers[Vx];
+    index = (index + registers[Vx]) & 0xFFFu;
   }
 
   // LD F, Vx : Set I = Location of sprite for digit Vx
@@ -615,6 +671,10 @@ public:
     uint8_t Vx = (opcode & 0x0F00u) >> 8u;
     uint8_t digit = registers[Vx];
 
+    if (digit > 0xF)
+    {
+      return;
+    }
     index = FONTSET_START_ADDRESS + (5 * digit);
   }
 
@@ -624,6 +684,11 @@ public:
   {
     uint8_t Vx = (opcode & 0x0F00u) >> 8u;
     uint8_t value = registers[Vx];
+
+    if (static_cast<size_t>(index) + 2 >= sizeof(memory))
+    {
+      return;
+    }
 
     // Ones
     memory[index + 2] = value % 10;
@@ -642,9 +707,19 @@ public:
   {
     uint8_t Vx = (opcode & 0x0F00u) >> 8u;
 
+    if (static_cast<size_t>(index) + Vx >= sizeof(memory))
+    {
+      return;
+    }
+
     for (uint8_t i = 0; i <= Vx; i++)
     {
       memory[index + i] = registers[i];
+    }
+
+    if (memoryIncrementQuirk)
+    {
+      index = (index + Vx + 1) & 0xFFFu;
     }
   }
 
@@ -653,9 +728,19 @@ public:
   {
     uint8_t Vx = (opcode & 0x0F00u) >> 8u;
 
+    if (static_cast<size_t>(index) + Vx >= sizeof(memory))
+    {
+      return;
+    }
+
     for (uint8_t i = 0; i <= Vx; i++)
     {
       registers[i] = memory[index + i];
+    }
+
+    if (memoryIncrementQuirk)
+    {
+      index = (index + Vx + 1) & 0xFFFu;
     }
   }
 };

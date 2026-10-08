@@ -36,9 +36,9 @@ To run a ROM (for example, the included Tetris game), run the compiled binary wi
 ### Command Usage
 
 ```cmd
-.\bin\main.exe <clock_speed> <scale> <path_to_rom>
+.\bin\main.exe <scale> <delay> <path_to_rom>
 ```
 
-- `<clock_speed>`: Execution speed parameter.
 - `<scale>`: Display window scaling factor.
+- `<delay>`: Delay in ms between CPU cycles (execution speed).
 - `<path_to_rom>`: Path to the `.ch8` ROM file.

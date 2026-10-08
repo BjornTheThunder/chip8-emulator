@@ -2,33 +2,75 @@
 #define PLATFORM_H
 
 #include <SDL2/SDL.h>
+#include <stdexcept>
 
 class Platform
 {
 public:
     Platform(char const *title, int windowWidth, int windowHeight, int textureWidth, int textureHeight)
     {
-        SDL_Init(SDL_INIT_VIDEO);
+        if (SDL_Init(SDL_INIT_VIDEO) != 0)
+        {
+            throw std::runtime_error(SDL_GetError());
+        }
 
         window = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, windowWidth, windowHeight, SDL_WINDOW_SHOWN);
+        if (!window)
+        {
+            SDL_Quit();
+            throw std::runtime_error(SDL_GetError());
+        }
 
         renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+        if (!renderer)
+        {
+            // Fallback to software rendering
+            renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+        }
+        if (!renderer)
+        {
+            SDL_DestroyWindow(window);
+            window = nullptr;
+            SDL_Quit();
+            throw std::runtime_error(SDL_GetError());
+        }
 
         texture = SDL_CreateTexture(
             renderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_STREAMING, textureWidth, textureHeight);
+        if (!texture)
+        {
+            SDL_DestroyRenderer(renderer);
+            renderer = nullptr;
+            SDL_DestroyWindow(window);
+            window = nullptr;
+            SDL_Quit();
+            throw std::runtime_error(SDL_GetError());
+        }
     }
 
     ~Platform()
     {
-        SDL_DestroyTexture(texture);
-        SDL_DestroyRenderer(renderer);
-        SDL_DestroyWindow(window);
+        if (texture)
+        {
+            SDL_DestroyTexture(texture);
+        }
+        if (renderer)
+        {
+            SDL_DestroyRenderer(renderer);
+        }
+        if (window)
+        {
+            SDL_DestroyWindow(window);
+        }
         SDL_Quit();
     }
 
     void Update(void const *buffer, int pitch)
     {
-        SDL_UpdateTexture(texture, nullptr, buffer, pitch);
+        if (SDL_UpdateTexture(texture, nullptr, buffer, pitch) != 0)
+        {
+            return;
+        }
         SDL_RenderClear(renderer);
         SDL_RenderCopy(renderer, texture, nullptr, nullptr);
         SDL_RenderPresent(renderer);
@@ -37,6 +79,11 @@ public:
     bool ProcessInput(uint8_t *keys)
     {
         bool quit = false;
+
+        if (!keys)
+        {
+            return false;
+        }
 
         SDL_Event event;
 
